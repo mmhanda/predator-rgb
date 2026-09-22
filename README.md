@@ -64,9 +64,9 @@ stepping is untouched, and the real screen-brightness keys keep working because 
 ACPI Video Bus rather than the AT keyboard. The rule is scoped by DMI so it can only ever match a
 PT314-51s. To revert, delete it and run `systemd-hwdb update && udevadm trigger`.
 
-On the same keyboard Fn+F9 decodes to scancode `0xcf` -> `KEY_END`, which types an End keystroke
-into whatever has focus. Left alone here since it is not this project's business, but it can be
-neutralised the same way.
+The same file also silences Fn+F9, which decodes to scancode `0xcf` -> `KEY_END` and typed an End
+keystroke into whatever had focus. There is no keyboard-backlight LED class on this machine for it
+to drive, so it is silenced rather than remapped to something nothing would handle.
 
 ## Status
 

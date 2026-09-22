@@ -6,5 +6,9 @@
 # because they arrive over the ACPI Video Bus, not the AT keyboard.
 #
 # Remove this file and run `systemd-hwdb update && udevadm trigger` to revert.
+# Fn+F9 decodes to scancode 0xcf, which the kernel maps to KEY_END - so pressing it
+# types an End keystroke into whatever has focus. There is no keyboard-backlight LED
+# class on this machine for it to drive, so it is silenced rather than remapped.
 evdev:atkbd:dmi:bvn*:bvr*:bd*:svnAcer*:pnPredator*PT314-51s*:*
  KEYBOARD_KEY_ef=reserved
+ KEYBOARD_KEY_cf=reserved
