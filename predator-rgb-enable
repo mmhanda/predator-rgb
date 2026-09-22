@@ -1,0 +1,79 @@
+#!/usr/bin/python3 -I
+"""
+predator-rgb-enable - arm RGB keyboard control on the Acer Predator PT314-51s.
+
+The embedded controller stores keyboard colours at any time but only renders
+them while its "PredatorSense enabled" flag (PSEE, register 0x03 bit 4) is set.
+Windows' PredatorSense keeps that flag on; nothing on Linux does, so the
+keyboard falls back to its default blue. This helper sets the flag and tells
+the EC the keyboard has three lit zones. It takes no arguments and touches
+nothing else.
+"""
+
+import os
+import subprocess
+import sys
+
+MODEL = "Predator PT314-51s"
+EC_NODES = ("/dev/ec", "/sys/kernel/debug/ec/ec0/io")
+
+REG_FLAGS, PSEE = 0x03, 0x10       # bit 4 = PredatorSense enabled
+REG_ZONES, THREE_ZONES = 0x1F, 0x07
+
+
+def say(msg, code=None):
+    print(f"predator-rgb-enable: {msg}", file=sys.stderr if code else sys.stdout)
+    if code is not None:
+        sys.exit(code)
+
+
+def open_ec():
+    for attempt in range(2):
+        for node in EC_NODES:
+            try:
+                return os.open(node, os.O_RDWR)
+            except OSError:
+                continue
+        if attempt == 0:        # neither node exists yet: try loading a provider
+            subprocess.run(["modprobe", "acpi_ec"], stderr=subprocess.DEVNULL)
+            if not os.path.exists(EC_NODES[0]):
+                subprocess.run(["modprobe", "ec_sys", "write_support=1"],
+                               stderr=subprocess.DEVNULL)
+    say("no writable EC interface (/dev/ec or ec_sys debugfs)", 1)
+
+
+def main():
+    try:
+        with open("/sys/class/dmi/id/product_name") as f:
+            model = f.read().strip()
+    except OSError:
+        model = ""
+    if model != MODEL:
+        say(f"refusing to write the EC on '{model}' - this is only verified on {MODEL}", 1)
+
+    fd = open_ec()
+    try:
+        def read(reg):
+            os.lseek(fd, reg, os.SEEK_SET)
+            return os.read(fd, 1)[0]
+
+        def write(reg, value):
+            os.lseek(fd, reg, os.SEEK_SET)
+            os.write(fd, bytes([value]))
+
+        flags = read(REG_FLAGS)
+        if not flags & PSEE:
+            write(REG_FLAGS, flags | PSEE)
+        if read(REG_ZONES) != THREE_ZONES:
+            write(REG_ZONES, THREE_ZONES)
+        ok = bool(read(REG_FLAGS) & PSEE) and read(REG_ZONES) == THREE_ZONES
+    finally:
+        os.close(fd)
+
+    if not ok:
+        say("the EC did not accept the change", 1)
+    say("RGB control armed")
+
+
+if __name__ == "__main__":
+    main()

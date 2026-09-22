@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""
+predator-rgb - RGB keyboard control for the Acer Predator Triton 300 SE (PT314-51s).
+
+Colours and effects go through the facer kernel module's character devices,
+which call the laptop's own Acer gaming WMI methods:
+
+  /dev/acer-gkbbl-static-0   4 bytes  [zone bitmask, r, g, b]
+                                      zones: 1 = left, 2 = middle, 4 = right
+  /dev/acer-gkbbl-0         16 bytes  [mode, speed, brightness, 8 if wave else 0,
+                                       direction, r, g, b, 0, 1, 0...]
+
+The EC only renders any of it while its PredatorSense flag is set - see
+predator-rgb-enable, which predator-rgb.service runs at boot and after resume.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+STATIC_DEV = "/dev/acer-gkbbl-static-0"
+DYNAMIC_DEV = "/dev/acer-gkbbl-0"
+EC_DEV = "/dev/ec"
+ENABLE_HELPER = "/usr/local/sbin/predator-rgb-enable"
+STATE = "/var/lib/predator-rgb/state.json"
+
+ZONES = ("left", "middle", "right")
+ZONE_MASKS = (1, 2, 4)            # the firmware wants a bitmask, not an index
+
+MODES = {"static": 0, "breathing": 1, "neon": 2, "wave": 3, "shifting": 4, "zoom": 5}
+COLOR_MODES = ("breathing", "shifting", "zoom")     # effects that take a colour
+DIRECTION_MODES = ("wave", "shifting")              # effects that take a direction
+DIRECTIONS = {"rtl": 1, "ltr": 2}
+
+COLORS = {
+    "black": (0, 0, 0), "white": (255, 255, 255), "red": (255, 0, 0),
+    "green": (0, 255, 0), "blue": (0, 0, 255), "yellow": (255, 255, 0),
+    "cyan": (0, 255, 255), "magenta": (255, 0, 255), "orange": (255, 80, 0),
+    "purple": (140, 0, 255), "pink": (255, 40, 120), "lime": (140, 255, 0),
+    "teal": (0, 200, 150), "gold": (255, 170, 0), "crimson": (220, 20, 60),
+    "sky": (0, 120, 255),
+}
+
+
+class RgbError(Exception):
+    pass
+
+
+def default_state():
+    return {
+        "mode": "static",
+        "zones": [[0, 255, 0], [0, 255, 0], [0, 255, 0]],
+        "color": [0, 255, 0],
+        "speed": 5,
+        "direction": "ltr",
+        "brightness": 100,
+        "on": True,
+    }
+
+
+def clamp(value, lo, hi):
+    return max(lo, min(hi, int(value)))
+
+
+def parse_color(text):
+    key = text.strip().lower()
+    if key in COLORS:
+        return COLORS[key]
+    digits = key[1:] if key.startswith("#") else key
+    if re.fullmatch(r"[0-9a-f]{6}", digits):
+        return tuple(int(digits[i:i + 2], 16) for i in (0, 2, 4))
+    if re.fullmatch(r"[0-9a-f]{3}", digits):
+        return tuple(int(c * 2, 16) for c in digits)
+    parts = [p.strip() for p in key.split(",")]
+    if len(parts) == 3 and all(p.isdigit() and int(p) <= 255 for p in parts):
+        return tuple(int(p) for p in parts)
+    raise RgbError(f"cannot parse colour {text!r} - use a name, #rrggbb or r,g,b")
+
+
+def is_rgb(value):
+    return (isinstance(value, (list, tuple)) and len(value) == 3
+            and all(isinstance(c, int) and 0 <= c <= 255 for c in value))
+
+
+def load_state():
+    state = default_state()
+    try:
+        with open(STATE) as f:
+            saved = json.load(f)
+    except (OSError, ValueError):
+        return state
+    if not isinstance(saved, dict):
+        return state
+    if saved.get("mode") in MODES:
+        state["mode"] = saved["mode"]
+    zones = saved.get("zones")
+    if isinstance(zones, list) and len(zones) == 3 and all(is_rgb(z) for z in zones):
+        state["zones"] = [list(z) for z in zones]
+    if is_rgb(saved.get("color")):
+        state["color"] = list(saved["color"])
+    if isinstance(saved.get("speed"), int):
+        state["speed"] = clamp(saved["speed"], 0, 9)
+    if saved.get("direction") in DIRECTIONS:
+        state["direction"] = saved["direction"]
+    if isinstance(saved.get("brightness"), int):
+        state["brightness"] = clamp(saved["brightness"], 0, 100)
+    if isinstance(saved.get("on"), bool):
+        state["on"] = saved["on"]
+    return state
+
+
+def save_state(state):
+    try:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        tmp = STATE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, STATE)
+    except OSError as exc:
+        print(f"predator-rgb: could not save settings ({exc})", file=sys.stderr)
+
+
+def armed():
+    """Whether the EC's PredatorSense flag is set; None if it cannot be read."""
+    try:
+        fd = os.open(EC_DEV, os.O_RDONLY)
+    except OSError:
+        return None
+    try:
+        os.lseek(fd, 0x03, os.SEEK_SET)
+        return bool(os.read(fd, 1)[0] & 0x10)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def write_dev(path, payload):
+    try:
+        with open(path, "wb") as dev:
+            dev.write(payload)
+    except FileNotFoundError:
+        raise RgbError(f"{path} is missing - is the 'facer' module loaded?")
+    except OSError as exc:
+        raise RgbError(f"writing {path} failed: {exc}")
+
+
+def apply(state):
+    """Push a state dict to the keyboard."""
+    brightness = clamp(state["brightness"], 0, 100) if state["on"] else 0
+    payload = bytearray(16)
+    if state["mode"] == "static":
+        for mask, (r, g, b) in zip(ZONE_MASKS, state["zones"]):
+            write_dev(STATIC_DEV, bytes([mask, r, g, b]))
+    else:
+        mode = MODES[state["mode"]]
+        payload[0] = mode
+        payload[1] = clamp(state["speed"], 0, 9)
+        payload[3] = 8 if mode == MODES["wave"] else 0
+        payload[4] = DIRECTIONS[state["direction"]]
+        payload[5], payload[6], payload[7] = state["color"]
+    payload[2] = brightness
+    payload[9] = 1
+    write_dev(DYNAMIC_DEV, bytes(payload))
+
+
+# The firmware's own Fn-key brightness cycling renders from the EC's global colour
+# registers, not from the per-zone ones. We only ever set the zones, so after a cold
+# boot the globals still hold a firmware default and the first cycle flashes that
+# colour before settling. Writing them to match keeps the firmware's own rendering in
+# step. EC RAM is root-only, so this is a no-op for the normal per-user calls and does
+# its work from the boot service.
+EC_DEV = "/dev/ec"
+EC_GLOBAL_RGB = 0x1C
+
+
+def sync_ec_global_colour(rgb):
+    try:
+        fd = os.open(EC_DEV, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        os.lseek(fd, EC_GLOBAL_RGB, os.SEEK_SET)
+        os.write(fd, bytes(int(c) & 0xFF for c in rgb))
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def commit(state):
+    apply(state)
+    save_state(state)
+    if armed() is False:
+        print("predator-rgb: the EC is not armed, so it will ignore this - "
+              "run: predator-rgb enable", file=sys.stderr)
+
+
+def hexcolor(rgb):
+    return "#%02x%02x%02x" % tuple(rgb)
+
+
+def cmd_static(args):
+    colors = [parse_color(c) for c in args.colors]
+    if len(colors) == 1:
+        colors *= 3
+    elif len(colors) != 3:
+        raise RgbError("give 1 colour (whole keyboard) or 3 (left middle right)")
+    state = load_state()
+    state.update(mode="static", zones=[list(c) for c in colors], on=True)
+    if args.brightness is not None:
+        state["brightness"] = clamp(args.brightness, 0, 100)
+    commit(state)
+
+
+def cmd_zone(args):
+    names = {"left": 0, "middle": 1, "mid": 1, "center": 1, "centre": 1, "right": 2,
+             "1": 0, "2": 1, "3": 2}
+    if args.zone.lower() not in names:
+        raise RgbError("zone must be left, middle, right (or 1, 2, 3)")
+    state = load_state()
+    state["zones"][names[args.zone.lower()]] = list(parse_color(args.color))
+    state.update(mode="static", on=True)
+    commit(state)
+
+
+def cmd_effect(args):
+    state = load_state()
+    state.update(mode=args.name, on=True)
+    if args.speed is not None:
+        state["speed"] = clamp(args.speed, 0, 9)
+    if args.brightness is not None:
+        state["brightness"] = clamp(args.brightness, 0, 100)
+    if args.direction is not None:
+        state["direction"] = args.direction
+    if args.color is not None:
+        state["color"] = list(parse_color(args.color))
+    commit(state)
+
+
+def cmd_brightness(args):
+    state = load_state()
+    state.update(brightness=clamp(args.level, 0, 100), on=True)
+    commit(state)
+
+
+def cmd_on(args):
+    state = load_state()
+    state["on"] = True
+    if state["brightness"] == 0:
+        state["brightness"] = 100
+    commit(state)
+
+
+def cmd_off(args):
+    state = load_state()
+    state["on"] = False
+    commit(state)
+
+
+def cmd_toggle(args):
+    (cmd_off if load_state()["on"] else cmd_on)(args)
+
+
+def cmd_restore(args):
+    if not os.path.exists(STATE):
+        return
+    state = load_state()
+    apply(state)
+    # Leftmost zone stands in for the whole keyboard; with one colour set they agree.
+    sync_ec_global_colour(state["zones"][0] if state["mode"] == "static" else state["color"])
+
+
+def cmd_enable(args):
+    if armed():
+        print("RGB control is already armed.")
+    else:
+        prefix = [] if os.geteuid() == 0 else ["sudo"]
+        if subprocess.run(prefix + [ENABLE_HELPER]).returncode != 0:
+            raise RgbError("could not arm the EC")
+    cmd_restore(args)
+
+
+def cmd_status(args):
+    state = load_state()
+    flag = {True: "armed", False: "NOT armed - run: predator-rgb enable",
+            None: "unknown (cannot read /dev/ec)"}[armed()]
+    print(f"EC RGB control : {flag}")
+    print(f"backlight      : {'on' if state['on'] else 'off'}, brightness {state['brightness']}")
+    print(f"mode           : {state['mode']}")
+    if state["mode"] == "static":
+        for name, rgb in zip(ZONES, state["zones"]):
+            print(f"  {name:<7}: {hexcolor(rgb)}")
+    else:
+        print(f"  speed {state['speed']}", end="")
+        if state["mode"] in DIRECTION_MODES:
+            print(f", direction {state['direction']}", end="")
+        if state["mode"] in COLOR_MODES:
+            print(f", colour {hexcolor(state['color'])}", end="")
+        print()
+
+
+def cmd_list(args):
+    print("effects :", "  ".join(m for m in MODES if m != "static"))
+    print("          colour applies to:", ", ".join(COLOR_MODES))
+    print("          direction applies to:", ", ".join(DIRECTION_MODES))
+    print("colours :", "  ".join(COLORS))
+    print("          or #rrggbb, #rgb, r,g,b")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="predator-rgb",
+        description="RGB keyboard control for the Acer Predator PT314-51s.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="examples:\n"
+               "  predator-rgb static green\n"
+               "  predator-rgb static red '#00ff88' blue      (left middle right)\n"
+               "  predator-rgb zone middle orange\n"
+               "  predator-rgb effect wave --speed 6 --direction rtl\n"
+               "  predator-rgb effect breathing --color purple\n"
+               "  predator-rgb brightness 40\n"
+               "  predator-rgb off")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("static", help="solid colour: 1 for all zones, or 3 (left middle right)")
+    p.add_argument("colors", nargs="+", metavar="COLOR")
+    p.add_argument("--brightness", type=int)
+    p.set_defaults(func=cmd_static)
+
+    p = sub.add_parser("zone", help="recolour one zone: left, middle or right")
+    p.add_argument("zone")
+    p.add_argument("color")
+    p.set_defaults(func=cmd_zone)
+
+    p = sub.add_parser("effect", help="animated effect")
+    p.add_argument("name", choices=[m for m in MODES if m != "static"])
+    p.add_argument("--speed", type=int, help="1 slowest - 9 fastest")
+    p.add_argument("--brightness", type=int, help="0-100")
+    p.add_argument("--direction", choices=sorted(DIRECTIONS), help="wave, shifting")
+    p.add_argument("--color", help="breathing, shifting, zoom")
+    p.set_defaults(func=cmd_effect)
+
+    p = sub.add_parser("brightness", help="0-100, keeps the current look")
+    p.add_argument("level", type=int)
+    p.set_defaults(func=cmd_brightness)
+
+    sub.add_parser("on", help="backlight on").set_defaults(func=cmd_on)
+    sub.add_parser("off", help="backlight off").set_defaults(func=cmd_off)
+    sub.add_parser("toggle", help="flip on/off").set_defaults(func=cmd_toggle)
+    sub.add_parser("status", help="show current settings").set_defaults(func=cmd_status)
+    sub.add_parser("restore", help="re-apply saved settings").set_defaults(func=cmd_restore)
+    sub.add_parser("enable", help="arm the EC so it renders colours (needs sudo)").set_defaults(func=cmd_enable)
+    sub.add_parser("list", help="effects and colour names").set_defaults(func=cmd_list)
+
+    args = ap.parse_args()
+    try:
+        args.func(args)
+    except RgbError as exc:
+        print(f"predator-rgb: {exc}", file=sys.stderr)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

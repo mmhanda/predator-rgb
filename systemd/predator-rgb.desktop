@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Predator RGB Keyboard
+Comment=Colours, zones and effects for the Predator keyboard backlight
+Exec=/usr/local/bin/predator-rgb-gui
+Icon=preferences-desktop-keyboard
+Terminal=false
+Categories=Settings;HardwareSettings;
+Keywords=keyboard;backlight;rgb;color;colour;predator;acer;lighting;

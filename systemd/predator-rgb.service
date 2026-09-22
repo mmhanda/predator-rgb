@@ -1,0 +1,16 @@
+[Unit]
+Description=Arm and restore Predator RGB keyboard lighting
+After=systemd-modules-load.service multi-user.target
+After=suspend.target hibernate.target hybrid-sleep.target suspend-then-hibernate.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/predator-rgb-enable
+ExecStart=/usr/local/bin/predator-rgb restore
+
+[Install]
+WantedBy=multi-user.target
+WantedBy=suspend.target
+WantedBy=hibernate.target
+WantedBy=hybrid-sleep.target
+WantedBy=suspend-then-hibernate.target

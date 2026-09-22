@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""GTK3 control panel for the Predator RGB keyboard."""
+
+import importlib.util
+import subprocess
+import sys
+from importlib.machinery import SourceFileLoader
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+
+# predator-rgb has no .py suffix, so the loader must be named explicitly.
+_loader = SourceFileLoader("predator_rgb", "/usr/local/bin/predator-rgb")
+_spec = importlib.util.spec_from_loader(_loader.name, _loader)
+rgb = importlib.util.module_from_spec(_spec)
+_loader.exec_module(rgb)
+
+MODE_LABELS = [("static", "Static"), ("breathing", "Breathing"), ("neon", "Neon"),
+               ("wave", "Wave"), ("shifting", "Shifting"), ("zoom", "Zoom")]
+
+PRESETS = [("Red", (255, 0, 0)), ("Orange", (255, 80, 0)), ("Gold", (255, 170, 0)),
+           ("Green", (0, 255, 0)), ("Teal", (0, 200, 150)), ("Cyan", (0, 255, 255)),
+           ("Sky", (0, 120, 255)), ("Blue", (0, 0, 255)), ("Purple", (140, 0, 255)),
+           ("Pink", (255, 40, 120)), ("White", (255, 255, 255))]
+
+RAINBOW = ["linear-gradient(to right, #ff0030, #ffd000)",
+           "linear-gradient(to right, #ffd000, #00f090, #00d0ff)",
+           "linear-gradient(to right, #00d0ff, #3040ff, #e000ff)"]
+
+BASE_CSS = """
+button.zone { min-height: 96px; border-radius: 12px; border: 3px solid alpha(black, 0.35);
+              font-weight: bold; text-shadow: none; box-shadow: none; }
+button.zone.selected { border-color: @theme_selected_bg_color; }
+button.swatch { min-width: 30px; min-height: 30px; padding: 0; border-radius: 15px;
+                border: 1px solid alpha(black, 0.4); box-shadow: none; background-image: none; }
+"""
+
+
+def hexcolor(c):
+    return "#%02x%02x%02x" % tuple(c)
+
+
+def text_on(c):
+    return "#000000" if 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2] > 140 else "#ffffff"
+
+
+class Panel(Gtk.Window):
+    def __init__(self, snapshot=None):
+        super().__init__()
+        self.state = rgb.load_state()
+        self.selected = 0
+        self.syncing = False
+        self.pending = None
+        self.snapshot = snapshot
+
+        bar = Gtk.HeaderBar(title="Predator RGB Keyboard",
+                            subtitle="Triton 300 SE · 3 zones")
+        bar.set_show_close_button(True)
+        self.power = Gtk.Switch(valign=Gtk.Align.CENTER, tooltip_text="Backlight on / off")
+        self.power.connect("notify::active", self.on_power)
+        bar.pack_end(self.power)
+        self.set_titlebar(bar)
+        self.set_default_size(560, -1)
+        self.set_resizable(False)
+
+        self.css = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), self.css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.add(root)
+
+        self.infobar = Gtk.InfoBar(message_type=Gtk.MessageType.WARNING)
+        self.infobar.get_content_area().add(Gtk.Label(
+            label="The keyboard controller is not armed, so it ignores colours.", xalign=0))
+        self.infobar.add_button("Enable", Gtk.ResponseType.OK)
+        self.infobar.connect("response", self.on_enable)
+        self.infobar.set_no_show_all(True)
+        root.pack_start(self.infobar, False, False, 0)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, border_width=18)
+        root.pack_start(body, True, True, 0)
+
+        zones = Gtk.Box(spacing=8, homogeneous=True)
+        self.zone_buttons = []
+        for i, name in enumerate(rgb.ZONES):
+            btn = Gtk.Button(label=name.upper())
+            ctx = btn.get_style_context()
+            ctx.add_class("zone")
+            ctx.add_class(f"zone{i}")
+            btn.connect("clicked", self.on_zone, i)
+            zones.pack_start(btn, True, True, 0)
+            self.zone_buttons.append(btn)
+        body.pack_start(zones, False, False, 0)
+
+        self.hint = Gtk.Label(xalign=0)
+        self.hint.get_style_context().add_class("dim-label")
+        body.pack_start(self.hint, False, False, 0)
+
+        grid = Gtk.Grid(column_spacing=14, row_spacing=12)
+        body.pack_start(grid, False, False, 0)
+
+        def row(n, text, widget):
+            grid.attach(Gtk.Label(label=text, xalign=0), 0, n, 1, 1)
+            widget.set_hexpand(True)
+            grid.attach(widget, 1, n, 1, 1)
+
+        self.mode = Gtk.ComboBoxText()
+        for key, label in MODE_LABELS:
+            self.mode.append(key, label)
+        self.mode.connect("changed", self.on_mode)
+        row(0, "Mode", self.mode)
+
+        colour_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        swatches = Gtk.Box(spacing=6)
+        for i, (name, value) in enumerate(PRESETS):
+            sw = Gtk.Button(tooltip_text=name)
+            ctx = sw.get_style_context()
+            ctx.add_class("swatch")
+            ctx.add_class(f"swatch{i}")
+            sw.connect("clicked", self.on_pick, value)
+            swatches.pack_start(sw, False, False, 0)
+        custom = Gtk.Button(label="Custom…")
+        custom.connect("clicked", self.on_custom)
+        swatches.pack_end(custom, False, False, 0)
+        colour_box.pack_start(swatches, False, False, 0)
+        self.link = Gtk.CheckButton(label="Same colour on all three zones")
+        self.link.connect("toggled", self.on_link)
+        colour_box.pack_start(self.link, False, False, 0)
+        self.colour_box = colour_box
+        row(1, "Colour", colour_box)
+
+        self.speed = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 1, 9, 1)
+        self.speed.set_digits(0)
+        self.speed.add_mark(1, Gtk.PositionType.BOTTOM, "slow")
+        self.speed.add_mark(9, Gtk.PositionType.BOTTOM, "fast")
+        self.speed.connect("value-changed", self.on_speed)
+        row(2, "Speed", self.speed)
+
+        self.direction = Gtk.ComboBoxText()
+        self.direction.append("ltr", "Left → Right")
+        self.direction.append("rtl", "Right → Left")
+        self.direction.connect("changed", self.on_direction)
+        row(3, "Direction", self.direction)
+
+        self.brightness = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        self.brightness.set_digits(0)
+        self.brightness.connect("value-changed", self.on_brightness)
+        row(4, "Brightness", self.brightness)
+
+        self.status = Gtk.Label(xalign=0, wrap=True)
+        self.status.get_style_context().add_class("dim-label")
+        body.pack_start(self.status, False, False, 0)
+
+        self.connect("destroy", Gtk.main_quit)
+        self.sync()
+        if rgb.armed() is False:
+            self.infobar.show()
+        if snapshot:
+            GLib.timeout_add(1500, self.take_snapshot)
+
+    # ---- state -> widgets -------------------------------------------------
+
+    def sync(self):
+        s = self.state
+        self.syncing = True
+        self.power.set_active(s["on"])
+        self.mode.set_active_id(s["mode"])
+        self.link.set_active(s["zones"][0] == s["zones"][1] == s["zones"][2])
+        self.speed.set_value(max(1, s["speed"]))
+        self.direction.set_active_id(s["direction"])
+        self.brightness.set_value(s["brightness"])
+        self.syncing = False
+        self.refresh()
+
+    def refresh(self):
+        s = self.state
+        mode = s["mode"]
+        static, coloured = mode == "static", mode in rgb.COLOR_MODES
+        self.colour_box.set_sensitive(static or coloured)
+        self.link.set_sensitive(static)
+        self.speed.set_sensitive(not static)
+        self.direction.set_sensitive(mode in rgb.DIRECTION_MODES)
+        if static:
+            self.hint.set_text("Click a zone to select it, then choose a colour.")
+        elif coloured:
+            self.hint.set_text("Choose the colour this effect animates.")
+        else:
+            self.hint.set_text("This effect cycles through the whole spectrum.")
+
+        dim = (0.35 + 0.65 * s["brightness"] / 100) if s["on"] else 0.0
+        rules = [BASE_CSS]
+        for i, btn in enumerate(self.zone_buttons):
+            ctx = btn.get_style_context()
+            if static and (self.link.get_active() or i == self.selected):
+                ctx.add_class("selected")
+            else:
+                ctx.remove_class("selected")
+            base = s["zones"][i] if static else s["color"]
+            shown = [int(c * dim) for c in base] if s["on"] else [28, 28, 28]
+            if s["on"] and not static and not coloured:
+                image = RAINBOW[i]
+                fg = "#ffffff"
+            else:
+                image, fg = "none", text_on(shown)
+            rules.append(f"button.zone{i} {{ background-image: {image}; "
+                         f"background-color: {hexcolor(shown)}; color: {fg}; }}")
+        for i, (_, value) in enumerate(PRESETS):
+            rules.append(f"button.swatch{i} {{ background-color: {hexcolor(value)}; }}")
+        self.css.load_from_data("\n".join(rules).encode())
+
+    # ---- widgets -> state -------------------------------------------------
+
+    def push(self):
+        """Coalesce bursts (slider drags) into one hardware write per 60 ms."""
+        self.refresh()
+        if self.pending:
+            GLib.source_remove(self.pending)
+        self.pending = GLib.timeout_add(60, self.flush)
+
+    def flush(self):
+        self.pending = None
+        try:
+            rgb.apply(self.state)
+            rgb.save_state(self.state)
+            self.status.set_text("")
+        except rgb.RgbError as exc:
+            self.status.set_text(str(exc))
+        return False
+
+    def set_colour(self, value):
+        value = [int(c) for c in value]
+        if self.state["mode"] == "static":
+            targets = range(3) if self.link.get_active() else [self.selected]
+            for i in targets:
+                self.state["zones"][i] = list(value)
+        else:
+            self.state["color"] = value
+        self.push()
+
+    def on_zone(self, _btn, index):
+        self.selected = index
+        self.refresh()
+
+    def on_pick(self, _btn, value):
+        self.set_colour(value)
+
+    def on_custom(self, _btn):
+        dialog = Gtk.ColorChooserDialog(title="Choose a colour", transient_for=self)
+        dialog.set_use_alpha(False)
+        s = self.state
+        current = s["zones"][self.selected] if s["mode"] == "static" else s["color"]
+        dialog.set_rgba(Gdk.RGBA(*[c / 255 for c in current], 1))
+        if dialog.run() == Gtk.ResponseType.OK:
+            c = dialog.get_rgba()
+            self.set_colour([round(c.red * 255), round(c.green * 255), round(c.blue * 255)])
+        dialog.destroy()
+
+    def on_link(self, _check):
+        if self.syncing:
+            return
+        if self.link.get_active():
+            self.set_colour(self.state["zones"][self.selected])
+        else:
+            self.refresh()
+
+    def on_mode(self, combo):
+        if self.syncing or not combo.get_active_id():
+            return
+        self.state["mode"] = combo.get_active_id()
+        self.push()
+
+    def on_speed(self, scale):
+        if not self.syncing:
+            self.state["speed"] = int(scale.get_value())
+            self.push()
+
+    def on_direction(self, combo):
+        if not self.syncing and combo.get_active_id():
+            self.state["direction"] = combo.get_active_id()
+            self.push()
+
+    def on_brightness(self, scale):
+        if not self.syncing:
+            self.state["brightness"] = int(scale.get_value())
+            self.push()
+
+    def on_power(self, switch, _param):
+        if not self.syncing:
+            self.state["on"] = switch.get_active()
+            self.push()
+
+    def on_enable(self, _bar, _response):
+        result = subprocess.run(["pkexec", rgb.ENABLE_HELPER], capture_output=True, text=True)
+        if result.returncode == 0:
+            self.infobar.hide()
+            self.push()
+        else:
+            self.status.set_text("Could not arm the controller: "
+                                 + (result.stderr.strip() or "authorisation cancelled"))
+
+    def take_snapshot(self):
+        window = self.get_window()
+        pixbuf = Gdk.pixbuf_get_from_window(window, 0, 0, window.get_width(), window.get_height())
+        pixbuf.savev(self.snapshot, "png", [], [])
+        Gtk.main_quit()
+        return False
+
+
+def main():
+    snapshot = None
+    if len(sys.argv) == 3 and sys.argv[1] == "--snapshot":
+        snapshot = sys.argv[2]
+    Panel(snapshot).show_all()
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    main()
