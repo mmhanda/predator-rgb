@@ -1,0 +1,10 @@
+# Acer Predator PT314-51s: Fn+F4 steps the keyboard backlight, which the EC does
+# entirely in firmware - it needs no key event. The key nevertheless also emits
+# atkbd scancode 0xef, which the kernel maps to KEY_BRIGHTNESSDOWN, so every press
+# dimmed the screen as a side effect. Suppress that one scancode; the firmware's
+# backlight stepping is untouched, and the screen-brightness keys are unaffected
+# because they arrive over the ACPI Video Bus, not the AT keyboard.
+#
+# Remove this file and run `systemd-hwdb update && udevadm trigger` to revert.
+evdev:atkbd:dmi:bvn*:bvr*:bd*:svnAcer*:pnPredator*PT314-51s*:*
+ KEYBOARD_KEY_ef=reserved

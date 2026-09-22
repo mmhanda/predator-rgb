@@ -53,6 +53,21 @@ restores your colours at boot and after suspend, since the EC forgets on power l
 The helper that sets the EC flag refuses to run on any machine whose DMI product name is not a
 model it has been verified on, so it cannot poke the EC of unrelated hardware.
 
+## Fn+F4 also dimmed the screen
+
+The EC steps the keyboard backlight itself, in firmware, with no key event needed. But the same key
+additionally emits atkbd scancode `0xef`, which the kernel maps to `KEY_BRIGHTNESSDOWN` - so every
+press dimmed the display as a side effect.
+
+`udev/61-predator-pt314-51s.hwdb` maps that one scancode to `reserved`. The firmware's backlight
+stepping is untouched, and the real screen-brightness keys keep working because they arrive over the
+ACPI Video Bus rather than the AT keyboard. The rule is scoped by DMI so it can only ever match a
+PT314-51s. To revert, delete it and run `systemd-hwdb update && udevadm trigger`.
+
+On the same keyboard Fn+F9 decodes to scancode `0xcf` -> `KEY_END`, which types an End keystroke
+into whatever has focus. Left alone here since it is not this project's business, but it can be
+neutralised the same way.
+
 ## Status
 
 Developed and tested on one PT314-51s (board `Clubman_TLM`, BIOS V1.10), Ubuntu 22.04, kernel 6.8,
